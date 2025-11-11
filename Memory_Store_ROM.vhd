@@ -114,7 +114,7 @@ architecture Behavioral of Memory_Store is
     77 => OP_WAIT  & x"00" & x"00",
     78 => OP_SUB   & x"00" & x"00",
     79 => OP_BR_NZ & x"4D" & x"00",
-    80 => OP_JUMP  & x"48" & x"00",
+    --80 => OP_JUMP  & x"48" & x"00",
     
     81 => OP_STOP  & x"00" & x"00",
 
