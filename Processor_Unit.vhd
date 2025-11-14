@@ -151,7 +151,7 @@ FSM_Process : process(master_clk)
               when x"01" => fsm_state <= s_load_x_1;
               when x"02" => fsm_state <= s_load_y_1;
               when x"03" | x"04" | x"05" |
-                   x"06" | x"09" 
+                   x"06" | x"09" | x"0E"
                          => fsm_state <= s_execute;
                          
               -- MODIFICADO: Si es un salto, NO incrementa el PC
