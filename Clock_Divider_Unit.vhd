@@ -11,7 +11,7 @@ entity Clock_Divider_Unit is
 end entity;
 
 architecture Behavioral of Clock_Divider_Unit is
-  constant COUNT_1HZ  : integer := 500;   -- 53,200,000 ciclos = 1 s
+  constant COUNT_1HZ  : integer := 53199999;   -- 53,200,000 ciclos = 1 s
   constant COUNT_1KHZ : integer := 53199;     -- 53,200 ciclos = 1 ms
 
   signal counter_1hz  : integer range 0 to COUNT_1HZ  := 0;

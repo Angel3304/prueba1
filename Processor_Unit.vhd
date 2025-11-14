@@ -186,7 +186,9 @@ begin
               when x"01" => fsm_state <= s_load_x_1;
               when x"02" => fsm_state <= s_load_y_1;
               when x"03" | x"04" |
-                   x"06" | x"08" | x"09"
+                   x"05" | -- MODIFICADO: Añadir CMP
+                   x"06" | x"08" | x"09" |
+                   x"0B" | x"0C" | x"0D" -- MODIFICADO: Añadir nuevos Branches
                          => fsm_state <= s_execute;
               when x"07" => fsm_state <= s_go_to;
               when x"0A" => fsm_state <= s_wait_pulse;
@@ -211,6 +213,11 @@ begin
                 arith_in_B   <= x"00" & operand_2;
                 arith_op_sel <= "0110";                    -- ADD (igual que 03)
                 fsm_state    <= s_alu_writeback;
+				  when x"05" =>                                 -- CMP (X - Y)
+                arith_in_A   <= reg_X;
+                arith_in_B   <= reg_Y;
+                arith_op_sel <= "0111";                    -- SUB (igual que 09)
+                fsm_state    <= s_alu_writeback;           -- Va a guardar banderas
               when x"09" =>                                 -- SUB  (X-Y)
                 arith_in_A   <= reg_X;
                 arith_in_B   <= reg_Y;
@@ -226,6 +233,24 @@ begin
                   prog_counter <= unsigned(operand_1);
                 end if;
                 fsm_state <= s_fetch_1;
+				  
+				  when x"0B" =>                                 -- BS (Branch on Sign)
+                if status_register(2) = '1' then -- Revisa S-flag
+                  prog_counter <= unsigned(operand_1);
+                end if;
+                fsm_state <= s_fetch_1;
+
+              when x"0C" =>                                 -- BNC (Branch on Not Carry)
+                if status_register(1) = '0' then -- Revisa C-flag
+                  prog_counter <= unsigned(operand_1);
+                end if;
+                fsm_state <= s_fetch_1;
+
+              when x"0D" =>                                 -- BNV (Branch on Not Overflow)
+                if status_register(0) = '0' then -- Revisa OV-flag
+                  prog_counter <= unsigned(operand_1);
+                end if;
+                fsm_state <= s_fetch_1;
 
               when others =>
                 fsm_state <= s_fetch_1;
@@ -235,9 +260,12 @@ begin
           --  ALU WRITE-BACK
           ----------------------------------------------
           when s_alu_writeback =>
-            -- MODIFICADO: Almacena el resultado de 16 bits
-            reg_X           <= arith_out(15 downto 0);
-            -- MODIFICADO: Almacena las 4 banderas en el registro de estado
+            -- MODIFICADO: Solo guarda el resultado si es una operación aritmética
+            if op_code = x"03" or op_code = x"04" or op_code = x"09" then
+              reg_X <= arith_out(15 downto 0);
+            end if;
+            
+            -- Siempre guarda las banderas (para CMP, ADD, SUB, etc.)
             status_register(3) <= z_flag_alu; -- Z
             status_register(2) <= s_flag_alu; -- S
             status_register(1) <= c_flag_alu; -- C
