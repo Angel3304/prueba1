@@ -8,6 +8,7 @@ entity Processor_Unit is
     master_clk   : in  std_logic;
     master_reset : in  std_logic;
     master_run   : in  std_logic;
+	 eq_select_in   : in  std_logic_vector(1 downto 0);
     o_seg_a      : out std_logic; o_seg_b : out std_logic; o_seg_c : out std_logic;
     o_seg_d      : out std_logic; o_seg_e : out std_logic; o_seg_f : out std_logic;
     o_seg_g      : out std_logic; o_seg_dp: out std_logic;
@@ -107,6 +108,12 @@ architecture Behavioral of Processor_Unit is
   signal div_done       : std_logic;
   signal div_quotient   : std_logic_vector(7 downto 0);
   signal div_remainder  : std_logic_vector(7 downto 0);
+  
+  signal io_data_in       : std_logic_vector(23 downto 0);
+  signal data_bus_mux_out : std_logic_vector(23 downto 0);
+  -- Dirección especial para leer los switches
+  constant IO_ADDR_SWITCHES : std_logic_vector(7 downto 0) := x"F0";
+  
 begin
 
   U_Mem : Memory_Store
@@ -145,19 +152,26 @@ begin
       R_out => div_remainder,
       done  => div_done
     );
-
+	
+  -- Formatear la entrada del switch (2 bits) a un bus de 24 bits
+  io_data_in <= x"00" & "00000000000000" & eq_select_in;
+  data_bus_mux_out <= io_data_in when mem_addr_reg = IO_ADDR_SWITCHES else
+                      mem_data_from_ram;
+							 
   op_code   <= instr_reg(23 downto 16);
   operand_1 <= instr_reg(15 downto 8);
   operand_2 <= instr_reg(7 downto 0);
+  
+  
 
 FSM_Process : process(master_clk)
   begin
     if rising_edge(master_clk) then
       pulse_1hz_last <= pulse_1hz;
-		
-		div_start <= '0';
-		
-		mem_we <= '0';
+      
+      -- Asegurarnos que las señales de control duren 1 ciclo
+      div_start <= '0';
+      mem_we    <= '0'; 
       
       if master_reset = '0' then
         prog_counter      <= (others => '0');
@@ -167,8 +181,7 @@ FSM_Process : process(master_clk)
         output_buffer     <= (others => '0');
         status_register   <= (others => '0');
         pulse_1hz_last    <= '0';
-		  div_start <= '0';
-		  mem_we <= '0';
+        div_start         <= '0';
         
       elsif master_run = '1' then
         null;
@@ -184,135 +197,129 @@ FSM_Process : process(master_clk)
             fsm_state    <= s_fetch_2;
 
           ----------------------------------------------
-          --  FETCH 2: Leer instrucción
+          --  FETCH 2: Leer instrucción e INCREMENTAR PC
           ----------------------------------------------
           when s_fetch_2 =>
-            instr_reg    <= mem_data_from_ram;
-            -- MODIFICADO: El incremento del PC se mueve a s_decode
+            instr_reg    <= data_bus_mux_out;
+            prog_counter <= prog_counter + 1; -- <-- PC se incrementa SIEMPRE aquí
             fsm_state    <= s_decode;
             
           ----------------------------------------------
-          --  DECODE: Decodificar y decidir incremento de PC
+          --  DECODE
           ----------------------------------------------
           when s_decode =>
             arith_op_sel <= (others => '0');
-            prog_counter <= prog_counter + 1;
             
             case op_code is
               when x"01" => fsm_state <= s_load_x_1;
               when x"02" => fsm_state <= s_load_y_1;
-              when x"03" | x"04" | x"05" |
-                   x"06" | x"09" | x"0E"
+              
+              -- Instrucciones que usan s_execute
+              when x"03" | x"04" | x"05" | -- ADD, ADDI, CMP
+                   x"06" |                 -- DISP
+                   x"09" |                 -- SUB
+                   x"0E" |                 -- MUL
+                   x"07" | x"08" | x"0B" | x"0C" | x"0D" -- Jumps
                          => fsm_state <= s_execute;
                          
-              -- MODIFICADO: Si es un salto, NO incrementa el PC
-              when x"07" | x"08" | x"0B" | x"0C" | x"0D" =>
-                prog_counter <= prog_counter; -- Mantiene el PC
-                fsm_state    <= s_execute;
+              when x"0A" => -- WAIT
+                prog_counter <= prog_counter - 1; -- Anular PC+1
+                fsm_state    <= s_wait_pulse;
                 
-              when x"0A" => fsm_state <= s_wait_pulse;
-              when x"0F" => fsm_state <= s_idle;
-				  when x"10" => 
-						prog_counter <= prog_counter; -- para no incrementar nuevamente
-						fsm_state <= s_div_start;
-					when OP_STX => -- x"11"
-                fsm_state <= s_store_1;
-						
+              when x"0F" => -- STOP
+                prog_counter <= prog_counter - 1; -- Anular PC+1
+                fsm_state    <= s_idle;
+              
+              when x"10" => -- DIV
+                prog_counter <= prog_counter - 1; -- Anular PC+1
+                fsm_state    <= s_div_start;
+                
+              when x"11" => -- STX
+                fsm_state    <= s_store_1; -- (STX usa PC+1, está bien)
+                
               when others => fsm_state <= s_fetch_1;
             end case;
 
           ----------------------------------------------
-          --  EXECUTE: Ejecutar la instrucción
+          --  EXECUTE
           ----------------------------------------------
           when s_execute =>
-            -- Por defecto, avanza al siguiente fetch
-            fsm_state <= s_fetch_1;
+            fsm_state <= s_fetch_1; -- Volver a fetch por defecto
             
             case op_code is
-              when x"03" =>                                 -- ADD  (X+Y)
+              -- ALU (van a writeback)
+              when x"03" => -- ADD
                 arith_in_A   <= reg_X;
                 arith_in_B   <= reg_Y;
                 arith_op_sel <= "0110";
                 fsm_state    <= s_alu_writeback;
                 
-              when x"04" =>                                 -- ADDI (X+inmediato)
+              when x"04" => -- ADDI
                 arith_in_A   <= reg_X;
                 arith_in_B   <= x"00" & operand_2;
                 arith_op_sel <= "0110";
                 fsm_state    <= s_alu_writeback;
                 
-              -- NUEVO: Lógica para CMP (X-Y)
-              when x"05" =>                                 -- CMP (X-Y)
-                arith_in_A   <= reg_X;
-                arith_in_B   <= reg_Y;
-                arith_op_sel <= "0111";                    -- SUB
-                fsm_state    <= s_alu_writeback;           -- Va a guardar banderas
-                
-              when x"06" =>                                 -- DISP
-                output_buffer <= reg_X;
-                fsm_state     <= s_fetch_1;
-                
-              when x"09" =>                                 -- SUB  (X-Y)
+              when x"05" => -- CMP
                 arith_in_A   <= reg_X;
                 arith_in_B   <= reg_Y;
                 arith_op_sel <= "0111";
                 fsm_state    <= s_alu_writeback;
-				  when x"0E" =>                                 -- MUL (8x8)
+                
+              when x"09" => -- SUB
+                arith_in_A   <= reg_X;
+                arith_in_B   <= reg_Y;
+                arith_op_sel <= "0111";
+                fsm_state    <= s_alu_writeback;
+                
+              when x"0E" => -- MUL
                 arith_in_A   <= reg_X;
                 arith_in_B   <= reg_Y;
                 arith_op_sel <= "1000";
                 fsm_state    <= s_alu_writeback;
-            
-              -- MODIFICADO: Lógica de saltos
-              -- Ahora el PC se actualiza a PC+1 o a la dirección de salto
-              
-              when x"07" => -- JUMP (no usado)
+                
+              -- *** LÓGICA DE DISP RESTAURADA ***
+              when x"06" =>
+                output_buffer <= reg_X;
+                
+              -- Saltos (La lógica de PC ya es correcta)
+              when x"07" => -- JUMP
                 prog_counter <= unsigned(operand_1);
 
-              when x"08" => -- BNZ (Branch if NOT zero)
+              when x"08" => -- BNZ
                 if status_register(3) = '0' then
-                  prog_counter <= unsigned(operand_1); -- Salta
-                else
-                  prog_counter <= prog_counter + 1; -- No salta (va a PC+1)
+                  prog_counter <= unsigned(operand_1);
                 end if;
 
-              when x"0B" => -- BS (Branch on Sign)
+              when x"0B" => -- BS
                 if status_register(2) = '1' then
-                  prog_counter <= unsigned(operand_1); -- Salta
-                else
-                  prog_counter <= prog_counter + 1; -- No salta (va a PC+1)
+                  prog_counter <= unsigned(operand_1);
                 end if;
 
-              when x"0C" => -- BNC (Branch on Not Carry)
+              when x"0C" => -- BNC
                 if status_register(1) = '0' then
-                  prog_counter <= unsigned(operand_1); -- Salta
-                else
-                  prog_counter <= prog_counter + 1; -- No salta (va a PC+1)
+                  prog_counter <= unsigned(operand_1);
                 end if;
 
-              when x"0D" => -- BNV (Branch on Not Overflow)
+              when x"0D" => -- BNV
                 if status_register(0) = '0' then
-                  prog_counter <= unsigned(operand_1); -- Salta
-                else
-                  prog_counter <= prog_counter + 1; -- No salta (va a PC+1)
+                  prog_counter <= unsigned(operand_1);
                 end if;
                 
               when others =>
-                null; -- No hace nada más
+                null;
             end case;
 
           ----------------------------------------------
-          --  (El resto de estados: s_alu_writeback, 
-          --   s_load_x, s_load_y, s_wait_pulse, s_idle
-          --   NO TIENEN CAMBIOS)
+          --  Otros Estados (sin cambios, excepto WAIT e IDLE)
           ----------------------------------------------
 
           when s_alu_writeback =>
+            -- (Esta lógica no cambia)
             if op_code = x"03" or op_code = x"04" or op_code = x"09" or
                op_code = x"0E" then
-              reg_X <= arith_out(15 downto 0); -- Guarda el resultado de 16b
+              reg_X <= arith_out(15 downto 0); 
             end if;
-				
             status_register(3) <= z_flag_alu;
             status_register(2) <= s_flag_alu;
             status_register(1) <= c_flag_alu;
@@ -323,54 +330,57 @@ FSM_Process : process(master_clk)
             mem_addr_reg <= operand_1;
             fsm_state    <= s_load_x_2;
           when s_load_x_2 =>
-            reg_X   <= mem_data_from_ram(15 downto 0);
+            reg_X   <= data_bus_mux_out(15 downto 0);
             fsm_state <= s_fetch_1;
 
           when s_load_y_1 =>
             mem_addr_reg <= operand_1;
             fsm_state    <= s_load_y_2;
           when s_load_y_2 =>
-            reg_Y   <= mem_data_from_ram(15 downto 0);
+            reg_Y   <= data_bus_mux_out(15 downto 0);
             fsm_state <= s_fetch_1;
 
+          when s_go_to => -- (Este estado ya no se usa, pero lo dejamos)
+            prog_counter <= unsigned(operand_1);
+            fsm_state    <= s_fetch_1;
+            
           when s_wait_pulse =>
             if pulse_1hz = '1' and pulse_1hz_last = '0' then
-              fsm_state <= s_fetch_1;
+              prog_counter <= prog_counter + 1; -- Re-incrementar el PC
+              fsm_state    <= s_fetch_1;
             end if;
 
           when s_idle =>
-            null;
-			 when s_div_start =>
-            div_start <= '1'; -- Activar el divisor por 1 ciclo
-            fsm_state <= s_div_wait; -- Moverse a esperar
+            null; -- Se queda aquí, PC no importa
+
+          -- Estados de División (El PC se maneja en s_div_read)
+          when s_div_start =>
+            div_start <= '1';
+            fsm_state <= s_div_wait;
             
           when s_div_wait =>
             if div_done = '1' then
-              fsm_state <= s_div_read; -- Terminado, ir a leer
-            else
-              fsm_state <= s_div_wait; -- No terminado, seguir esperando
+              fsm_state <= s_div_read;
             end if;
             
           when s_div_read =>
-            -- Guardar resultado (Cociente 8 bits) en los 8 bits bajos de reg_X
             reg_X <= x"00" & div_quotient;
-            
-            -- Guardar Residuo en los 8 bits bajos de reg_Y (opcional, pero útil)
             reg_Y <= x"00" & div_remainder; 
             
-            -- Actualizar banderas Z y S (C y OV se quedan en 0)
-            status_register <= "0000"; -- Resetear
+            status_register <= "0000";
             if unsigned(div_quotient) = 0 then
               status_register(3) <= '1'; -- Z-flag
             end if;
             status_register(2) <= div_quotient(7); -- S-flag
             
-            prog_counter <= prog_counter + 1; -- Incrementar PC
-            fsm_state    <= s_fetch_1;        -- Volver a fetch
-			 when s_store_1 =>
-            mem_addr_reg    <= operand_1; -- Poner la dirección
-            mem_data_to_ram <= x"00" & reg_X; -- Poner los datos (16 bits)
-            mem_we          <= '1';        -- Activar escritura
+            prog_counter <= prog_counter + 1; -- Incrementar PC (el que anulamos en s_decode)
+            fsm_state    <= s_fetch_1;
+            
+          -- Estado de Store (PC+1 de s_fetch_2 es correcto)
+          when s_store_1 =>
+            mem_addr_reg    <= operand_1;
+            mem_data_to_ram <= x"00" & reg_X;
+            mem_we          <= '1';
             fsm_state       <= s_fetch_1;
 
           when others => fsm_state <= s_idle;
