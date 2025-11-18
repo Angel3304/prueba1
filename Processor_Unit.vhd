@@ -19,8 +19,13 @@ end entity Processor_Unit;
 architecture Behavioral of Processor_Unit is
   
   component Memory_Store is
-    port( Addr_in : in  std_logic_vector(7 downto 0);
-          Data_bus: out std_logic_vector(23 downto 0) );
+    port(
+      clk      : in  std_logic;
+      we       : in  std_logic;
+      Addr_in  : in  std_logic_vector(7 downto 0);
+      Data_in  : in  std_logic_vector(23 downto 0);
+      Data_out : out std_logic_vector(23 downto 0)
+    );
   end component;
 
   component Arithmetic_Logic_Module is
@@ -42,17 +47,37 @@ architecture Behavioral of Processor_Unit is
            pulse_1khz_out : out std_logic;
            pulse_1hz_out  : out std_logic );
   end component;
-
+  
+  component Divider_8bit is
+    port (
+      clk   : in  std_logic;
+      rst   : in  std_logic;
+      start : in  std_logic;
+      A_in  : in  std_logic_vector(7 downto 0);
+      B_in  : in  std_logic_vector(7 downto 0);
+      Q_out : out std_logic_vector(7 downto 0);
+      R_out : out std_logic_vector(7 downto 0);
+      done  : out std_logic
+    );
+  end component;
+  constant OP_STX : std_logic_vector(7 downto 0) := x"11";
+  
   type t_fsm_state is (s_fetch_1, s_fetch_2, s_decode, s_execute,
                        s_alu_writeback, s_load_x_1, s_load_x_2,
                        s_load_y_1, s_load_y_2, s_wait_pulse,
-                       s_idle, s_go_to);
+                       s_idle, s_go_to,
+                       s_div_start, s_div_wait, s_div_read,
+                       s_store_1); -- <-- NUEVO
+                       
   signal fsm_state : t_fsm_state := s_fetch_1;
-
+  
   signal prog_counter  : unsigned(7 downto 0) := (others => '0');
   signal instr_reg     : std_logic_vector(23 downto 0);
-  signal mem_addr_reg  : std_logic_vector(7 downto 0);
-  signal mem_data_bus  : std_logic_vector(23 downto 0);
+  
+  signal mem_addr_reg     : std_logic_vector(7 downto 0); -- (Ya existía)
+  signal mem_data_from_ram : std_logic_vector(23 downto 0); -- (Antes 'mem_data_bus')
+  signal mem_data_to_ram   : std_logic_vector(23 downto 0); -- NUEVO
+  signal mem_we           : std_logic := '0';              -- NUEVO
 
   signal op_code   : std_logic_vector(7 downto 0);
   signal operand_1,
@@ -76,11 +101,22 @@ architecture Behavioral of Processor_Unit is
   signal bcd_value, display_data : std_logic_vector(15 downto 0);
   signal anode_enable    : std_logic_vector(3 downto 0);
   signal cathode_segments: std_logic_vector(6 downto 0);
+  
+  -- Señales para controlar el divisor
+  signal div_start      : std_logic := '0';
+  signal div_done       : std_logic;
+  signal div_quotient   : std_logic_vector(7 downto 0);
+  signal div_remainder  : std_logic_vector(7 downto 0);
 begin
 
   U_Mem : Memory_Store
-    port map ( Addr_in => mem_addr_reg,
-               Data_bus=> mem_data_bus );
+    port map (
+      clk      => master_clk,
+      we       => mem_we,
+      Addr_in  => mem_addr_reg,
+      Data_in  => mem_data_to_ram,
+      Data_out => mem_data_from_ram
+    );
                
   U_ALM : Arithmetic_Logic_Module
     port map ( op_A   => arith_in_A,
@@ -97,6 +133,18 @@ begin
                rst_in         => master_reset,
                pulse_1khz_out => pulse_1khz,
                pulse_1hz_out  => pulse_1hz );
+	
+	U_Div : Divider_8bit
+    port map (
+      clk   => master_clk,
+      rst   => master_reset,
+      start => div_start,
+      A_in  => reg_X(7 downto 0), -- Toma el dividendo de reg_X
+      B_in  => reg_Y(7 downto 0), -- Toma el divisor de reg_Y
+      Q_out => div_quotient,
+      R_out => div_remainder,
+      done  => div_done
+    );
 
   op_code   <= instr_reg(23 downto 16);
   operand_1 <= instr_reg(15 downto 8);
@@ -106,6 +154,10 @@ FSM_Process : process(master_clk)
   begin
     if rising_edge(master_clk) then
       pulse_1hz_last <= pulse_1hz;
+		
+		div_start <= '0';
+		
+		mem_we <= '0';
       
       if master_reset = '0' then
         prog_counter      <= (others => '0');
@@ -115,6 +167,8 @@ FSM_Process : process(master_clk)
         output_buffer     <= (others => '0');
         status_register   <= (others => '0');
         pulse_1hz_last    <= '0';
+		  div_start <= '0';
+		  mem_we <= '0';
         
       elsif master_run = '1' then
         null;
@@ -133,7 +187,7 @@ FSM_Process : process(master_clk)
           --  FETCH 2: Leer instrucción
           ----------------------------------------------
           when s_fetch_2 =>
-            instr_reg    <= mem_data_bus;
+            instr_reg    <= mem_data_from_ram;
             -- MODIFICADO: El incremento del PC se mueve a s_decode
             fsm_state    <= s_decode;
             
@@ -142,9 +196,6 @@ FSM_Process : process(master_clk)
           ----------------------------------------------
           when s_decode =>
             arith_op_sel <= (others => '0');
-            
-            -- MODIFICADO: Lógica de incremento de PC movida aquí
-            -- Por defecto, incrementa el PC...
             prog_counter <= prog_counter + 1;
             
             case op_code is
@@ -161,6 +212,12 @@ FSM_Process : process(master_clk)
                 
               when x"0A" => fsm_state <= s_wait_pulse;
               when x"0F" => fsm_state <= s_idle;
+				  when x"10" => 
+						prog_counter <= prog_counter; -- para no incrementar nuevamente
+						fsm_state <= s_div_start;
+					when OP_STX => -- x"11"
+                fsm_state <= s_store_1;
+						
               when others => fsm_state <= s_fetch_1;
             end case;
 
@@ -204,12 +261,6 @@ FSM_Process : process(master_clk)
                 arith_in_A   <= reg_X;
                 arith_in_B   <= reg_Y;
                 arith_op_sel <= "1000";
-                fsm_state    <= s_alu_writeback;
-
-              when x"10" =>                                 -- DIV (16/16)
-                arith_in_A   <= reg_X;
-                arith_in_B   <= reg_Y;
-                arith_op_sel <= "1001";
                 fsm_state    <= s_alu_writeback;
             
               -- MODIFICADO: Lógica de saltos
@@ -272,14 +323,14 @@ FSM_Process : process(master_clk)
             mem_addr_reg <= operand_1;
             fsm_state    <= s_load_x_2;
           when s_load_x_2 =>
-            reg_X   <= mem_data_bus(15 downto 0);
+            reg_X   <= mem_data_from_ram(15 downto 0);
             fsm_state <= s_fetch_1;
 
           when s_load_y_1 =>
             mem_addr_reg <= operand_1;
             fsm_state    <= s_load_y_2;
           when s_load_y_2 =>
-            reg_Y   <= mem_data_bus(15 downto 0);
+            reg_Y   <= mem_data_from_ram(15 downto 0);
             fsm_state <= s_fetch_1;
 
           when s_wait_pulse =>
@@ -289,6 +340,38 @@ FSM_Process : process(master_clk)
 
           when s_idle =>
             null;
+			 when s_div_start =>
+            div_start <= '1'; -- Activar el divisor por 1 ciclo
+            fsm_state <= s_div_wait; -- Moverse a esperar
+            
+          when s_div_wait =>
+            if div_done = '1' then
+              fsm_state <= s_div_read; -- Terminado, ir a leer
+            else
+              fsm_state <= s_div_wait; -- No terminado, seguir esperando
+            end if;
+            
+          when s_div_read =>
+            -- Guardar resultado (Cociente 8 bits) en los 8 bits bajos de reg_X
+            reg_X <= x"00" & div_quotient;
+            
+            -- Guardar Residuo en los 8 bits bajos de reg_Y (opcional, pero útil)
+            reg_Y <= x"00" & div_remainder; 
+            
+            -- Actualizar banderas Z y S (C y OV se quedan en 0)
+            status_register <= "0000"; -- Resetear
+            if unsigned(div_quotient) = 0 then
+              status_register(3) <= '1'; -- Z-flag
+            end if;
+            status_register(2) <= div_quotient(7); -- S-flag
+            
+            prog_counter <= prog_counter + 1; -- Incrementar PC
+            fsm_state    <= s_fetch_1;        -- Volver a fetch
+			 when s_store_1 =>
+            mem_addr_reg    <= operand_1; -- Poner la dirección
+            mem_data_to_ram <= x"00" & reg_X; -- Poner los datos (16 bits)
+            mem_we          <= '1';        -- Activar escritura
+            fsm_state       <= s_fetch_1;
 
           when others => fsm_state <= s_idle;
         end case;
