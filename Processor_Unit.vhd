@@ -9,6 +9,8 @@ entity Processor_Unit is
     master_reset : in  std_logic;
     master_run   : in  std_logic;
 	 eq_select_in   : in  std_logic_vector(1 downto 0);
+	 leds_out	  : out std_logic_vector(4 downto 0);
+	 o_flags		  : out std_logic_vector(3 downto 0);
     o_seg_a      : out std_logic; o_seg_b : out std_logic; o_seg_c : out std_logic;
     o_seg_d      : out std_logic; o_seg_e : out std_logic; o_seg_f : out std_logic;
     o_seg_g      : out std_logic; o_seg_dp: out std_logic;
@@ -114,6 +116,9 @@ architecture Behavioral of Processor_Unit is
   -- Dirección especial para leer los switches
   constant IO_ADDR_SWITCHES : std_logic_vector(7 downto 0) := x"F0";
   
+  constant IO_ADDR_LEDS		: std_logic_vector(7 downto 0) := x"E0";
+  signal leds_reg				: std_logic_vector (4 downto 0) := (others => '0');
+  
 begin
 
   U_Mem : Memory_Store
@@ -157,7 +162,7 @@ begin
   io_data_in <= x"00" & "00000000000000" & eq_select_in;
   data_bus_mux_out <= io_data_in when mem_addr_reg = IO_ADDR_SWITCHES else
                       mem_data_from_ram;
-							 
+  leds_out <= leds_reg;
   op_code   <= instr_reg(23 downto 16);
   operand_1 <= instr_reg(15 downto 8);
   operand_2 <= instr_reg(7 downto 0);
@@ -182,6 +187,7 @@ FSM_Process : process(master_clk)
         status_register   <= (others => '0');
         pulse_1hz_last    <= '0';
         div_start         <= '0';
+		  leds_reg			  <= (others => '0');
         
       elsif master_run = '1' then
         null;
@@ -378,12 +384,21 @@ FSM_Process : process(master_clk)
             
           -- Estado de Store (PC+1 de s_fetch_2 es correcto)
           when s_store_1 =>
-            mem_addr_reg    <= operand_1;
-            mem_data_to_ram <= x"00" & reg_X;
-            mem_we          <= '1';
-            fsm_state       <= s_fetch_1;
-
-          when others => fsm_state <= s_idle;
+            -- NUEVO: Lógica para escribir en LEDs o RAM
+            if operand_1 = IO_ADDR_LEDS then
+              -- Si la dirección es x"E0", escribimos en el registro de LEDs
+              leds_reg <= reg_X(4 downto 0);
+              -- NO activamos mem_we para no escribir basura en la RAM
+              mem_we <= '0';
+            else
+              -- Escritura normal en RAM
+              mem_addr_reg    <= operand_1;
+              mem_data_to_ram <= x"00" & reg_X;
+              mem_we          <= '1';
+            end if;
+            fsm_state <= s_fetch_1;
+			when others => fsm_state <= s_idle;
+			
         end case;
       end if;
     end if;
@@ -454,7 +469,6 @@ FSM_Process : process(master_clk)
     end case;
     cathode_segments <= decode_to_segments(current_digit_data);
   end process Display_Driver;
-
   o_seg_dp <= '1';
   o_seg_a <= cathode_segments(6);
   o_seg_b <= cathode_segments(5);
@@ -468,5 +482,6 @@ FSM_Process : process(master_clk)
   o_dig2 <= anode_enable(1);
   o_dig3 <= anode_enable(2);
   o_dig4 <= anode_enable(3);
+  o_flags <= status_register;
 
 end architecture Behavioral;
